@@ -1,11 +1,9 @@
 CXX = clang++
 CXXFLAGS = -g -std=c++11 -I. -Wall -Wextra -Wtype-limits -Wconversion -Wshadow # -fno-exceptions -DCPPHTTPLIB_NO_EXCEPTIONS -fsanitize=address
 
-PREFIX = /usr/local
-#PREFIX = $(shell brew --prefix)
+PREFIX ?= $(shell brew --prefix)
 
-OPENSSL_DIR = $(PREFIX)/opt/openssl@1.1
-#OPENSSL_DIR = $(PREFIX)/opt/openssl@3
+OPENSSL_DIR = $(PREFIX)/opt/openssl@3
 OPENSSL_SUPPORT = -DCPPHTTPLIB_OPENSSL_SUPPORT -I$(OPENSSL_DIR)/include -L$(OPENSSL_DIR)/lib -lssl -lcrypto
 
 ifneq ($(OS), Windows_NT)
@@ -20,7 +18,7 @@ ZLIB_SUPPORT = -DCPPHTTPLIB_ZLIB_SUPPORT -lz
 BROTLI_DIR = $(PREFIX)/opt/brotli
 BROTLI_SUPPORT = -DCPPHTTPLIB_BROTLI_SUPPORT -I$(BROTLI_DIR)/include -L$(BROTLI_DIR)/lib -lbrotlicommon -lbrotlienc -lbrotlidec
 
-TEST_ARGS = gtest/gtest-all.cc gtest/gtest_main.cc $(OPENSSL_SUPPORT) $(ZLIB_SUPPORT) $(BROTLI_SUPPORT) -pthread
+TEST_ARGS = gtest/gtest-all.cc gtest/gtest_main.cc $(OPENSSL_SUPPORT) $(ZLIB_SUPPORT) $(BROTLI_SUPPORT) -pthread -lcurl
 
 # By default, use standalone_fuzz_target_runner.
 # This runner does no fuzzing, but simply executes the inputs
@@ -29,6 +27,11 @@ TEST_ARGS = gtest/gtest-all.cc gtest/gtest_main.cc $(OPENSSL_SUPPORT) $(ZLIB_SUP
 # to link the fuzzer(s) against a real fuzzing engine.
 # OSS-Fuzz will define its own value for LIB_FUZZING_ENGINE.
 LIB_FUZZING_ENGINE ?= standalone_fuzz_target_runner.o
+
+CLANG_FORMAT = clang-format
+REALPATH = $(shell which grealpath 2>/dev/null || which realpath 2>/dev/null)
+STYLE_CHECK_FILES = $(filter-out httplib.h httplib.cc, \
+	$(wildcard example/*.h example/*.cc fuzzing/*.h fuzzing/*.cc *.h *.cc ../httplib.h))
 
 all : test test_split
 	./test
@@ -43,6 +46,31 @@ test : test.cc include_httplib.cc ../httplib.h Makefile cert.pem
 # link the split httplib.h, so there is normally no need to execute it.
 test_split : test.cc ../httplib.h httplib.cc Makefile cert.pem
 	$(CXX) -o $@ $(CXXFLAGS) test.cc httplib.cc $(TEST_ARGS)
+
+check_abi:
+	@./check-shared-library-abi-compatibility.sh
+
+.PHONY: style_check
+style_check: $(STYLE_CHECK_FILES)
+	@for file in $(STYLE_CHECK_FILES); do \
+		$(CLANG_FORMAT) $$file > $$file.formatted; \
+		if ! diff -u $$file $$file.formatted; then \
+			file2=$$($(REALPATH) --relative-to=.. $$file); \
+			printf "\n%*s\n" 80 | tr ' ' '#'; \
+			printf "##%*s##\n" 76; \
+			printf "##   %-70s   ##\n" "$$file2 not properly formatted. Please run clang-format."; \
+			printf "##%*s##\n" 76; \
+			printf "%*s\n\n" 80 | tr ' ' '#'; \
+			failed=1; \
+		fi; \
+		rm -f $$file.formatted; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo "Style check failed for one or more files. See above for details."; \
+		false; \
+	else \
+		echo "All files are properly formatted."; \
+	fi
 
 test_proxy : test_proxy.cc ../httplib.h Makefile cert.pem
 	$(CXX) -o $@ -I.. $(CXXFLAGS) test_proxy.cc $(TEST_ARGS)
@@ -65,16 +93,8 @@ httplib.cc : ../httplib.h
 	python3 ../split.py -o .
 
 cert.pem:
-	openssl genrsa 2048 > key.pem
-	openssl req -new -batch -config test.conf -key key.pem | openssl x509 -days 3650 -req -signkey key.pem > cert.pem
-	openssl req -x509 -config test.conf -key key.pem -sha256 -days 3650 -nodes -out cert2.pem -extensions SAN
-	openssl genrsa 2048 > rootCA.key.pem
-	openssl req -x509 -new -batch -config test.rootCA.conf -key rootCA.key.pem -days 1024 > rootCA.cert.pem
-	openssl genrsa 2048 > client.key.pem
-	openssl req -new -batch -config test.conf -key client.key.pem | openssl x509 -days 370 -req -CA rootCA.cert.pem -CAkey rootCA.key.pem -CAcreateserial > client.cert.pem
-	openssl genrsa -passout pass:test123! 2048 > key_encrypted.pem
-	openssl req -new -batch -config test.conf -key key_encrypted.pem | openssl x509 -days 3650 -req -signkey key_encrypted.pem > cert_encrypted.pem
-	#c_rehash .
+	./gen-certs.sh
 
 clean:
-	rm -f test test_split test_proxy server_fuzzer *.pem *.0 *.o *.1 *.srl httplib.h httplib.cc
+	rm -rf test test_split test_proxy server_fuzzer *.pem *.0 *.o *.1 *.srl httplib.h httplib.cc _build* *.dSYM
+
